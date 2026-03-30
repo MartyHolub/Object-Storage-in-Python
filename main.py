@@ -1,14 +1,13 @@
 from fastapi import FastAPI, UploadFile, File, Header, HTTPException, status
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-import os
-import json
 import uuid
 from datetime import datetime
 from pathlib import Path
 import aiofiles
-from typing import Optional, Dict, List
-import shutil
+
+from sqlalchemy import create_engine, Column, String, Integer, DateTime
+from sqlalchemy.orm import DeclarativeBase, Session
 
 # Inicializace FastAPI aplikace
 app = FastAPI(
@@ -28,39 +27,42 @@ app.add_middleware(
 
 # Konfigurace storage
 STORAGE_DIR = Path("storage")
-METADATA_FILE = Path("metadata.json")
 STORAGE_DIR.mkdir(exist_ok=True)
 
-# Inicializace metadata souboru
-if not METADATA_FILE.exists():
-    with open(METADATA_FILE, "w") as f:
-        json.dump({}, f, indent=2)
+# SQLAlchemy setup
+DATABASE_URL = "sqlite:///metadata.db"
+engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+class FileRecord(Base):
+    __tablename__ = "files"
+
+    id = Column(String, primary_key=True, index=True)
+    user_id = Column(String, nullable=False, index=True)
+    filename = Column(String, nullable=False)
+    path = Column(String, nullable=False)
+    size = Column(Integer, nullable=False)
+    created_at = Column(DateTime, nullable=False)
+
+
+# Vytvoř tabulky pokud neexistují
+Base.metadata.create_all(bind=engine)
 
 print(f"✅ Storage directory: {STORAGE_DIR.absolute()}")
-print(f"✅ Metadata file: {METADATA_FILE.absolute()}")
-
-
-def get_metadata() -> Dict:
-    """Načte metadata z JSON souboru"""
-    try:
-        with open(METADATA_FILE, "r") as f:
-            return json.load(f)
-    except (json.JSONDecodeError, FileNotFoundError):
-        return {}
-
-
-def save_metadata(metadata: Dict) -> None:
-    """Uloží metadata do JSON souboru"""
-    with open(METADATA_FILE, "w") as f:
-        json.dump(metadata, f, indent=2)
+print(f"✅ Database: {Path('metadata.db').absolute()}")
 
 
 def verify_user_access(file_id: str, user_id: str) -> bool:
     """Ověří, že uživatel má přístup k souboru"""
-    metadata = get_metadata()
-    if file_id not in metadata:
-        return False
-    return metadata[file_id]["user_id"] == user_id
+    with Session(engine) as session:
+        record = session.get(FileRecord, file_id)
+        if record is None:
+            return False
+        return record.user_id == user_id
 
 
 # ============ ROOT ENDPOINT ============
@@ -120,17 +122,24 @@ async def upload_file(
 
         print(f"✅ Soubor uložen: {file_path}")
 
-        # Ulož metadata
-        metadata = get_metadata()
-        metadata[file_id] = {
-            "id": file_id,
-            "user_id": x_user_id,
-            "filename": file.filename,
-            "path": str(file_path),
-            "size": len(file_content),
-            "created_at": datetime.now().isoformat()
-        }
-        save_metadata(metadata)
+        # Ulož metadata do databáze
+        try:
+            with Session(engine) as session:
+                record = FileRecord(
+                    id=file_id,
+                    user_id=x_user_id,
+                    filename=file.filename,
+                    path=str(file_path),
+                    size=len(file_content),
+                    created_at=datetime.now()
+                )
+                session.add(record)
+                session.commit()
+        except Exception:
+            # Pokud se uložení metadat nezdaří, smaž i fyzický soubor
+            if file_path.exists():
+                file_path.unlink()
+            raise
 
         print(f"✅ Metadata uložena: {file_id}")
 
@@ -168,10 +177,16 @@ async def download_file(
             detail="Soubor nenalezen nebo nemáš přístup"
         )
 
-    # Získej metadata
-    metadata = get_metadata()
-    file_info = metadata[file_id]
-    file_path = Path(file_info["path"])
+    # Získej metadata z databáze
+    with Session(engine) as session:
+        record = session.get(FileRecord, file_id)
+        if record is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Soubor nenalezen"
+            )
+        file_path = Path(record.path)
+        filename = record.filename
 
     # Ověř, že soubor existuje
     if not file_path.exists():
@@ -185,7 +200,7 @@ async def download_file(
 
     return FileResponse(
         path=file_path,
-        filename=file_info["filename"]
+        filename=filename
     )
 
 
@@ -209,26 +224,32 @@ async def delete_file(
             detail="Soubor nenalezen nebo nemáš přístup"
         )
 
-    # Získej metadata
-    metadata = get_metadata()
-    file_info = metadata[file_id]
-    file_path = Path(file_info["path"])
+    # Získej metadata a smaž záznam z databáze
+    with Session(engine) as session:
+        record = session.get(FileRecord, file_id)
+        if record is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Soubor nenalezen"
+            )
+        file_path = Path(record.path)
 
-    # Smaž soubor ze storage
-    try:
-        if file_path.exists():
-            file_path.unlink()
-            print(f"✅ Soubor smazán: {file_path}")
-    except Exception as e:
-        print(f"❌ Delete error: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Smazání souboru selhalo: {str(e)}"
-        )
+        # Smaž soubor ze storage
+        try:
+            if file_path.exists():
+                file_path.unlink()
+                print(f"✅ Soubor smazán: {file_path}")
+        except Exception as e:
+            print(f"❌ Delete error: {str(e)}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Smazání souboru selhalo: {str(e)}"
+            )
 
-    # Odstraň metadata
-    del metadata[file_id]
-    save_metadata(metadata)
+        # Odstraň metadata
+        session.delete(record)
+        session.commit()
+
     print(f"✅ Metadata odstraněna: {file_id}")
 
     return {"message": "Soubor smazán"}
@@ -245,14 +266,19 @@ async def list_files(
     """
     print(f"📋 List files: user={x_user_id}")
 
-    metadata = get_metadata()
-
-    # Filtruj soubory jen pro daného uživatele
-    user_files = [
-        file_info
-        for file_id, file_info in metadata.items()
-        if file_info["user_id"] == x_user_id
-    ]
+    with Session(engine) as session:
+        records = session.query(FileRecord).filter(FileRecord.user_id == x_user_id).all()
+        user_files = [
+            {
+                "id": r.id,
+                "user_id": r.user_id,
+                "filename": r.filename,
+                "path": r.path,
+                "size": r.size,
+                "created_at": r.created_at.isoformat()
+            }
+            for r in records
+        ]
 
     print(f"✅ Nalezeno {len(user_files)} souborů")
 
